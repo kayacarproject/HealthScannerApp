@@ -69,7 +69,7 @@ export default function ResultScreen({route, navigation}) {
   const {
     barcode, name, brand, ingredients,
     sugars100g, energy100g, nutriscoreGrade,
-    allergens, imageUrl,
+    allergens, imageUrl, isOcr, parsedIngredients,
   } = product;
 
   return (
@@ -109,33 +109,62 @@ export default function ResultScreen({route, navigation}) {
             <NutriscoreBadge grade={nutriscoreGrade} />
           </View>
 
-          <Text style={styles.barcodeText}>
-            <Ionicons name="barcode-outline" size={13} color={colors.textSecondary} />
-            {'  '}{barcode}
-          </Text>
+          {barcode ? (
+            <Text style={styles.barcodeText}>
+              <Ionicons name="barcode-outline" size={13} color={colors.textSecondary} />
+              {'  '}{barcode}
+            </Text>
+          ) : null}
         </View>
 
-        {/* ── Nutrition Highlights ─────────────────────────────────────── */}
-        <Text style={styles.sectionTitle}>Nutrition Highlights</Text>
-        <View style={styles.pillRow}>
-          <MetricPill
-            icon="water-outline"
-            label="Sugars"
-            value={sugars100g !== null ? Number(sugars100g).toFixed(1) : null}
-            unit="g / 100g"
-          />
-          <MetricPill
-            icon="flash-outline"
-            label="Energy"
-            value={energy100g !== null ? Math.round(energy100g) : null}
-            unit="kcal / 100g"
-          />
-        </View>
+        {/* ── Nutrition Highlights — hide entirely for OCR scans ────────── */}
+        {!isOcr && (
+          <>
+            <Text style={styles.sectionTitle}>Nutrition Highlights</Text>
+            <View style={styles.pillRow}>
+              <MetricPill
+                icon="water-outline"
+                label="Sugars"
+                value={sugars100g !== null ? Number(sugars100g).toFixed(1) : null}
+                unit="g / 100g"
+              />
+              <MetricPill
+                icon="flash-outline"
+                label="Energy"
+                value={energy100g !== null ? Math.round(energy100g) : null}
+                unit="kcal / 100g"
+              />
+            </View>
+          </>
+        )}
 
         {/* ── Ingredients ──────────────────────────────────────────────── */}
         <Text style={styles.sectionTitle}>Ingredients</Text>
         <View style={styles.card}>
-          {ingredients ? (
+          {/* OCR path: show structured chips if available */}
+          {isOcr && parsedIngredients?.length > 0 ? (
+            <>
+              <View style={styles.ingredientCountRow}>
+                <View style={styles.ingredientCountBadge}>
+                  <Text style={styles.ingredientCountText}>
+                    {parsedIngredients.length} ingredient{parsedIngredients.length !== 1 ? 's' : ''}
+                  </Text>
+                </View>
+              </View>
+              <View style={styles.chipsWrap}>
+                {parsedIngredients.map((item, idx) => (
+                  <View key={idx} style={styles.chip}>
+                    <Text style={styles.chipName} numberOfLines={2}>{item.name}</Text>
+                    {item.quantity ? (
+                      <View style={styles.chipQtyBadge}>
+                        <Text style={styles.chipQtyText}>{item.quantity}</Text>
+                      </View>
+                    ) : null}
+                  </View>
+                ))}
+              </View>
+            </>
+          ) : ingredients ? (
             <Text style={styles.ingredientsText}>{ingredients}</Text>
           ) : (
             <Text style={styles.emptyFieldText}>No ingredients data available.</Text>
@@ -157,8 +186,15 @@ export default function ResultScreen({route, navigation}) {
           style={styles.scanBtn}
           activeOpacity={0.8}
           onPress={() => navigation.goBack()}>
-          <Ionicons name="barcode-outline" size={18} color="#FFF" style={styles.scanBtnIcon} />
-          <Text style={styles.scanBtnText}>Scan Another Product</Text>
+          <Ionicons
+            name={isOcr ? 'camera-outline' : 'barcode-outline'}
+            size={18}
+            color="#FFF"
+            style={styles.scanBtnIcon}
+          />
+          <Text style={styles.scanBtnText}>
+            {isOcr ? 'Scan Another Label' : 'Scan Another Product'}
+          </Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -286,6 +322,58 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: colors.textSecondary,
     fontStyle: 'italic',
+  },
+  ingredientCountRow: {
+    marginBottom: 12,
+  },
+  ingredientCountBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#CCFBF1',
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: '#99F6E4',
+  },
+  ingredientCountText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#0F766E',
+  },
+  chipsWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  chip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.background,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 5,
+    paddingLeft: 12,
+    paddingRight: 6,
+    gap: 6,
+    maxWidth: '100%',
+  },
+  chipName: {
+    fontSize: 13,
+    color: colors.textPrimary,
+    fontWeight: '500',
+    flexShrink: 1,
+  },
+  chipQtyBadge: {
+    backgroundColor: colors.primary,
+    borderRadius: 12,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+  },
+  chipQtyText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFF',
   },
   allergenBox: {
     flexDirection: 'row',

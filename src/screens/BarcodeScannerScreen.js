@@ -1,4 +1,4 @@
-import React, {useRef, useState, useCallback} from 'react';
+import React, {useRef, useState, useCallback, useEffect} from 'react';
 import {
   View,
   Text,
@@ -13,38 +13,90 @@ import {
   useCameraPermission,
   useCodeScanner,
 } from 'react-native-vision-camera';
+import {useIsFocused} from '@react-navigation/native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import {colors, radius} from '../theme';
 import {fetchProductByBarcode} from '../services/openFoodFactsService';
 
+const MOUNT_COOLDOWN_MS = 700;  // ignore scans for this long after screen gains focus
+const STABILITY_HOLD_MS = 350;  // same barcode must be seen for this long before committing
+
 export default function BarcodeScannerScreen({navigation}) {
   const {hasPermission, requestPermission} = useCameraPermission();
   const device = useCameraDevice('back');
+
+  const isFocused = useIsFocused();
+
+  // ── Cooldown: block scans for MOUNT_COOLDOWN_MS after screen gains focus ──
+  const readyRef = useRef(false);
+  const cooldownTimer = useRef(null);
+
+  useEffect(() => {
+    if (isFocused) {
+      readyRef.current = false;
+      cooldownTimer.current = setTimeout(() => {
+        readyRef.current = true;
+      }, MOUNT_COOLDOWN_MS);
+    } else {
+      // Screen lost focus — clear timer and mark not-ready
+      clearTimeout(cooldownTimer.current);
+      readyRef.current = false;
+    }
+    return () => clearTimeout(cooldownTimer.current);
+  }, [isFocused]);
 
   // ── Scan lock: prevents firing the API call on every frame ────────────────
   const isScanning = useRef(false);
   const [scanState, setScanState] = useState('idle'); // 'idle' | 'fetching' | 'notfound' | 'error'
   const [lastBarcode, setLastBarcode] = useState(null);
 
-  const handleCodeScanned = useCallback(async codes => {
-    if (isScanning.current) return;
-    const code = codes.find(c => c.value);
-    if (!code?.value) return;
+  // ── Stability tracking: same value must persist for STABILITY_HOLD_MS ─────
+  const candidateValue = useRef(null);   // barcode string being evaluated
+  const candidateFirst = useRef(null);   // Date.now() when candidate was first seen
 
+  const handleCodeScanned = useCallback(async codes => {
+    // 1. Hard gates — cooldown not elapsed or scan already committed
+    if (!readyRef.current) return;
+    if (isScanning.current) return;
+
+    const code = codes.find(c => c.value);
+    if (!code?.value) {
+      // No code in frame — reset candidate
+      candidateValue.current = null;
+      candidateFirst.current = null;
+      return;
+    }
+
+    const value = code.value;
+    const now = Date.now();
+
+    // 2. Stability check — require the same value for STABILITY_HOLD_MS
+    if (value !== candidateValue.current) {
+      // New or different barcode — start fresh window
+      candidateValue.current = value;
+      candidateFirst.current = now;
+      return;
+    }
+
+    // Same value seen before — check if hold time has elapsed
+    if (now - candidateFirst.current < STABILITY_HOLD_MS) return;
+
+    // 3. Commit — lock and call API
     isScanning.current = true;
-    const barcode = code.value;
+    candidateValue.current = null;
+    candidateFirst.current = null;
+
+    const barcode = value;
     setLastBarcode(barcode);
     setScanState('fetching');
 
-    console.log('[BarcodeScannerScreen] Scanned barcode:', barcode, '| type:', code.type);
+    console.log('[BarcodeScannerScreen] Stable barcode committed:', barcode, '| type:', code.type);
 
     try {
       const product = await fetchProductByBarcode(barcode);
       if (product) {
         console.log('[BarcodeScannerScreen] Product found:', product.name);
-        // Navigate to ResultScreen — scan lock stays on so camera stays paused
         navigation.navigate('Result', {product});
-        // Reset lock after navigation so coming back allows a fresh scan
         isScanning.current = false;
         setScanState('idle');
       } else {
@@ -60,6 +112,8 @@ export default function BarcodeScannerScreen({navigation}) {
   // Reset so the user can scan again
   const resetScan = useCallback(() => {
     isScanning.current = false;
+    candidateValue.current = null;
+    candidateFirst.current = null;
     setLastBarcode(null);
     setScanState('idle');
   }, []);

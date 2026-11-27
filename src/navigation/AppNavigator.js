@@ -22,6 +22,15 @@ const headerOpts = {
   contentStyle: {backgroundColor: colors.background},
 };
 
+// Active / inactive tab tint
+const TAB_ACTIVE = colors.primary; // Teal #0F766E
+const TAB_INACTIVE = '#64748B';    // Slate
+
+// React Navigation 7 tells a custom tabBarButton whether it is selected via
+// `aria-selected` (accessibilityState is no longer passed).
+const isSelected = props =>
+  !!(props['aria-selected'] ?? props.accessibilityState?.selected);
+
 // ── Tab icon map (non-center tabs only) ──────────────────────────────────────
 const TAB_ICONS = {
   Home:         {active: 'home',         inactive: 'home-outline'},
@@ -30,21 +39,66 @@ const TAB_ICONS = {
   Profile:      {active: 'person-circle',inactive: 'person-circle-outline'},
 };
 
+// ── Standard tab button ──────────────────────────────────────────────────────
+// Draws its own icon AND label, so the four surrounding tabs always show their
+// text no matter which tab (including the raised center one) is active.
+const TAB_LABELS = {
+  Home: 'Home',
+  History: 'History',
+  IngredientOcr: 'OCR',
+  Profile: 'Profile',
+};
+
+function TabButton({name, ...props}) {
+  const {onPress, onLongPress, testID} = props;
+  const focused = isSelected(props);
+  const color = focused ? TAB_ACTIVE : TAB_INACTIVE;
+  const icon = TAB_ICONS[name];
+  return (
+    <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityState={{selected: focused}}
+      accessibilityLabel={TAB_LABELS[name]}
+      testID={testID}
+      onPress={onPress}
+      onLongPress={onLongPress}
+      activeOpacity={0.7}
+      style={styles.tabBtn}>
+      <Ionicons name={focused ? icon.active : icon.inactive} size={24} color={color} />
+      <Text style={[styles.tabLabel, {color}]} numberOfLines={1}>
+        {TAB_LABELS[name]}
+      </Text>
+    </TouchableOpacity>
+  );
+}
+
+const HomeTabButton = props => <TabButton name="Home" {...props} />;
+const HistoryTabButton = props => <TabButton name="History" {...props} />;
+const OcrTabButton = props => <TabButton name="IngredientOcr" {...props} />;
+const ProfileTabButton = props => <TabButton name="Profile" {...props} />;
+const ScanTabButton = props => <CenterTabButton {...props} />;
+
 // ── Center tab button ────────────────────────────────────────────────────────
 // Sits in normal flex flow (no position:absolute) so siblings stay evenly
 // spaced. marginTop lifts the circle above the tab bar line; the white border
 // ring visually separates it from the bar surface.
-function CenterTabButton({onPress, accessibilityState}) {
-  const focused = accessibilityState?.selected;
+function CenterTabButton(props) {
+  const {onPress} = props;
+  const focused = isSelected(props);
   return (
     <TouchableOpacity
+      accessibilityRole="button"
+      accessibilityState={{selected: focused}}
+      accessibilityLabel="Scan barcode"
       onPress={onPress}
       activeOpacity={0.82}
       style={styles.centerOuter}>
       <View style={[styles.centerCircle, focused && styles.centerCircleFocused]}>
         <Ionicons name="barcode" size={28} color="#FFFFFF" />
       </View>
-      <Text style={styles.centerLabel}>Scan</Text>
+      <Text style={[styles.centerLabel, {color: focused ? TAB_ACTIVE : TAB_INACTIVE}]}>
+        Scan
+      </Text>
     </TouchableOpacity>
   );
 }
@@ -57,21 +111,10 @@ function MainTabs() {
 
   return (
     <Tab.Navigator
-      screenOptions={({route}) => ({
+      screenOptions={() => ({
         ...headerOpts,
-        tabBarIcon: ({focused, color, size}) => {
-          const map = TAB_ICONS[route.name];
-          if (!map) return null; // center tab renders its own icon
-          return (
-            <Ionicons
-              name={focused ? map.active : map.inactive}
-              size={size}
-              color={color}
-            />
-          );
-        },
-        tabBarActiveTintColor: colors.primary,
-        tabBarInactiveTintColor: colors.textSecondary,
+        tabBarActiveTintColor: TAB_ACTIVE,
+        tabBarInactiveTintColor: TAB_INACTIVE,
         tabBarStyle: {
           backgroundColor: colors.surface,
           borderTopColor: colors.border,
@@ -81,6 +124,9 @@ function MainTabs() {
           paddingTop: 6,
           // Must be visible so the raised circle is not clipped by the bar
           overflow: 'visible',
+          // Always paint above screen content (e.g. a live camera preview)
+          elevation: 8,
+          zIndex: 10,
         },
         tabBarLabelStyle: {fontSize: 11, fontWeight: '600'},
       })}>
@@ -88,12 +134,12 @@ function MainTabs() {
       <Tab.Screen
         name="Home"
         component={HomeScreen}
-        options={{title: 'Home', tabBarLabel: 'Home'}}
+        options={{title: 'Home', tabBarLabel: 'Home', tabBarButton: HomeTabButton}}
       />
       <Tab.Screen
-        name="History"
-        component={HistoryScreen}
-        options={{title: 'History', tabBarLabel: 'History'}}
+        name="IngredientOcr"
+        component={IngredientOcrScreen}
+        options={{title: 'Ingredient OCR', tabBarLabel: 'OCR', tabBarButton: OcrTabButton}}
       />
       <Tab.Screen
         name="BarcodeScanner"
@@ -101,18 +147,18 @@ function MainTabs() {
         options={{
           title: 'Barcode Scanner',
           tabBarShowLabel: false,
-          tabBarButton: props => <CenterTabButton {...props} />,
+          tabBarButton: ScanTabButton,
         }}
       />
       <Tab.Screen
-        name="IngredientOcr"
-        component={IngredientOcrScreen}
-        options={{title: 'Ingredient OCR', tabBarLabel: 'OCR'}}
+        name="History"
+        component={HistoryScreen}
+        options={{title: 'History', tabBarLabel: 'History', tabBarButton: HistoryTabButton}}
       />
       <Tab.Screen
         name="Profile"
         component={HealthProfileScreen}
-        options={{title: 'Health Profile', tabBarLabel: 'Profile'}}
+        options={{title: 'Health Profile', tabBarLabel: 'Profile', tabBarButton: ProfileTabButton}}
       />
     </Tab.Navigator>
   );
@@ -150,6 +196,15 @@ export default function AppNavigator() {
 const CIRCLE = 58;
 
 const styles = StyleSheet.create({
+  // Standard (non-center) tab: icon over label, fills its 1/5th slot
+  tabBtn: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'flex-start',
+    gap: 2,
+  },
+  tabLabel: {fontSize: 11, fontWeight: '600'},
+
   // Outer touchable fills the 1/5th slot; flex column centres circle + label
   centerOuter: {
     flex: 1,

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useMemo} from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,8 @@ import {
 import Ionicons from '@react-native-vector-icons/ionicons';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {colors, radius} from '../theme';
+import {parseOcrLabel} from '../services/ocrService';
+import {MetaPills, NutritionPills, IngredientChips} from '../components/OcrBreakdown';
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 
@@ -51,6 +53,13 @@ export default function ResultScreen({route, navigation}) {
   const insets = useSafeAreaInsets();
   const product = route?.params?.product;
 
+  // OCR scans: always re-parse the saved raw text so older history items also
+  // get the structured breakdown (name, MRP, weight, ingredients, nutrition).
+  const ocr = useMemo(
+    () => (product?.isOcr ? parseOcrLabel(product.ingredients || '') : null),
+    [product],
+  );
+
   // Guard: no product passed (shouldn't happen, but safe)
   if (!product) {
     return (
@@ -69,7 +78,7 @@ export default function ResultScreen({route, navigation}) {
   const {
     barcode, name, brand, ingredients,
     sugars100g, energy100g, nutriscoreGrade,
-    allergens, imageUrl, isOcr, parsedIngredients,
+    allergens, imageUrl, isOcr,
   } = product;
 
   return (
@@ -97,8 +106,14 @@ export default function ResultScreen({route, navigation}) {
 
           {/* Name + brand + barcode */}
           <Text style={styles.productName} numberOfLines={3}>
-            {name}
+            {isOcr ? ocr?.productName || name : name}
           </Text>
+
+          {isOcr && (ocr?.mrp || ocr?.weight) ? (
+            <View style={styles.ocrMeta}>
+              <MetaPills mrp={ocr.mrp} weight={ocr.weight} center />
+            </View>
+          ) : null}
 
           <View style={styles.metaRow}>
             {brand ? (
@@ -138,32 +153,21 @@ export default function ResultScreen({route, navigation}) {
           </>
         )}
 
+        {isOcr && ocr?.nutrition?.length > 0 && (
+          <>
+            <Text style={styles.sectionTitle}>Nutrition Highlights</Text>
+            <View style={styles.card}>
+              <NutritionPills items={ocr.nutrition} basis={ocr.nutritionBasis} />
+            </View>
+          </>
+        )}
+
         {/* ── Ingredients ──────────────────────────────────────────────── */}
         <Text style={styles.sectionTitle}>Ingredients</Text>
         <View style={styles.card}>
-          {/* OCR path: show structured chips if available */}
-          {isOcr && parsedIngredients?.length > 0 ? (
-            <>
-              <View style={styles.ingredientCountRow}>
-                <View style={styles.ingredientCountBadge}>
-                  <Text style={styles.ingredientCountText}>
-                    {parsedIngredients.length} ingredient{parsedIngredients.length !== 1 ? 's' : ''}
-                  </Text>
-                </View>
-              </View>
-              <View style={styles.chipsWrap}>
-                {parsedIngredients.map((item, idx) => (
-                  <View key={idx} style={styles.chip}>
-                    <Text style={styles.chipName} numberOfLines={2}>{item.name}</Text>
-                    {item.quantity ? (
-                      <View style={styles.chipQtyBadge}>
-                        <Text style={styles.chipQtyText}>{item.quantity}</Text>
-                      </View>
-                    ) : null}
-                  </View>
-                ))}
-              </View>
-            </>
+          {/* OCR path: structured chips from the parsed label */}
+          {isOcr && ocr?.ingredients?.length > 0 ? (
+            <IngredientChips items={ocr.ingredients} />
           ) : ingredients ? (
             <Text style={styles.ingredientsText}>{ingredients}</Text>
           ) : (
@@ -251,6 +255,7 @@ const styles = StyleSheet.create({
     lineHeight: 25,
     marginBottom: 10,
   },
+  ocrMeta: {marginBottom: 10},
   metaRow: {
     flexDirection: 'row',
     justifyContent: 'center',
@@ -322,58 +327,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: colors.textSecondary,
     fontStyle: 'italic',
-  },
-  ingredientCountRow: {
-    marginBottom: 12,
-  },
-  ingredientCountBadge: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#CCFBF1',
-    borderRadius: 20,
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderWidth: 1,
-    borderColor: '#99F6E4',
-  },
-  ingredientCountText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#0F766E',
-  },
-  chipsWrap: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.background,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 5,
-    paddingLeft: 12,
-    paddingRight: 6,
-    gap: 6,
-    maxWidth: '100%',
-  },
-  chipName: {
-    fontSize: 13,
-    color: colors.textPrimary,
-    fontWeight: '500',
-    flexShrink: 1,
-  },
-  chipQtyBadge: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-  },
-  chipQtyText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#FFF',
   },
   allergenBox: {
     flexDirection: 'row',

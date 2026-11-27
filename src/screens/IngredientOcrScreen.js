@@ -1,47 +1,71 @@
-import React, {useRef, useState, useCallback, useMemo} from 'react';
+import React, {useRef, useState, useCallback, useEffect} from 'react';
 import {
   View,
   Text,
-  TextInput,
   TouchableOpacity,
   StyleSheet,
   ActivityIndicator,
-  ScrollView,
-  KeyboardAvoidingView,
-  Platform,
   Linking,
+  AppState,
 } from 'react-native';
 import {
   Camera,
   useCameraDevice,
-  useCameraPermission,
 } from 'react-native-vision-camera';
-import {useIsFocused} from '@react-navigation/native';
+import {useIsFocused, useFocusEffect} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import {colors, radius} from '../theme';
-import {recogniseIngredients, parseIngredients} from '../services/ocrService';
+import {recogniseIngredients, parseOcrLabel} from '../services/ocrService';
+import {saveScanToHistory} from '../storage/localStorage';
+import useCameraRecovery from '../components/useCameraRecovery';
+import CameraFailedView from '../components/CameraFailedView';
+
+function PermPoint({icon, text}) {
+  return (
+    <View style={styles.permPointRow}>
+      <Ionicons name={icon} size={18} color={colors.primary} />
+      <Text style={styles.permPointText}>{text}</Text>
+    </View>
+  );
+}
 
 // screen states
 // 'camera'   → live preview, ready to capture
 // 'ocr'      → photo taken, OCR running
-// 'review'   → OCR done, user edits text
 // 'empty'    → OCR returned nothing
 // 'error'    → OCR threw
 
-export default function IngredientOcrScreen({navigation}) {
-  const {hasPermission, requestPermission} = useCameraPermission();
+// Shown when we arrive from a failed barcode lookup
+function NoticeBanner({text, barcode, style}) {
+  if (!text) return null;
+  return (
+    <View style={[styles.notice, style]}>
+      <Ionicons name="information-circle" size={20} color={colors.primary} />
+      <View style={styles.noticeTextWrap}>
+        <Text style={styles.noticeText}>{text}</Text>
+        {barcode ? <Text style={styles.noticeSub}>Barcode {barcode}</Text> : null}
+      </View>
+    </View>
+  );
+}
+
+export default function IngredientOcrScreen({navigation, route}) {
+  // Passed by BarcodeScannerScreen's auto-fallback
+  const fallbackBarcode = route?.params?.barcode ?? null;
+  const notice = route?.params?.notice ?? null;
+
   const device = useCameraDevice('back');
   const cameraRef = useRef(null);
   const isFocused = useIsFocused();
+  const {cameraKey, cameraFailed, onCameraError, retryCamera} = useCameraRecovery(isFocused);
   const insets = useSafeAreaInsets();
 
   const [screenState, setScreenState] = useState('camera');
   const [flash, setFlash] = useState('off');          // 'off' | 'on'
-  const [editedText, setEditedText] = useState('');
   const [capturing, setCapturing] = useState(false);
 
-  // ── Capture & OCR ──────────────────────────────────────────────────────────
+  // ── Capture → OCR → straight to ResultScreen ───────────────────────────────
   const handleCapture = useCallback(async () => {
     if (!cameraRef.current || capturing) return;
     setCapturing(true);
@@ -51,80 +75,150 @@ export default function IngredientOcrScreen({navigation}) {
         flash,
         enableShutterSound: false,
       });
+      const imageUri = `file://${photo.path}`;
 
       setScreenState('ocr');
       setCapturing(false);
 
       const text = await recogniseIngredients(photo.path);
+      const trimmed = text ? text.trim() : '';
 
-      if (!text) {
+      if (!trimmed) {
         setScreenState('empty');
-      } else {
-        setEditedText(text);
-        setScreenState('review');
+        return;
       }
-    } catch (err) {
-      console.error('[IngredientOcrScreen] Capture/OCR error:', err);
-      setCapturing(false);
-      setScreenState('error');
-    }
-  }, [capturing, flash]);
 
-  const resetToCamera = useCallback(() => {
-    setEditedText('');
-    setScreenState('camera');
-  }, []);
-
-  // Derive parsed chips live as the user edits the raw text
-  const parsedIngredients = useMemo(() => parseIngredients(editedText), [editedText]);
-
-  const handleContinue = useCallback(() => {
-    const trimmed = editedText.trim();
-    if (!trimmed) return;
-    navigation.navigate('Result', {
-      product: {
-        name: 'Scanned Ingredient Label',
+      const parsed = parseOcrLabel(trimmed);
+      const product = {
+        name: parsed.productName || 'Scanned Ingredient Label',
         ingredients: trimmed,
-        parsedIngredients,          // structured array for chip display
+        parsedIngredients: parsed.ingredients,
+        ocr: {
+          productName: parsed.productName,
+          mrp: parsed.mrp,
+          weight: parsed.weight,
+          nutrition: parsed.nutrition,
+          nutritionBasis: parsed.nutritionBasis,
+          ingredientsFound: parsed.ingredientsFound,
+        },
         isOcr: true,
-        barcode: null,
+        barcode: fallbackBarcode,
         brand: null,
         sugars100g: null,
         energy100g: null,
         nutriscoreGrade: null,
         allergens: null,
-        imageUrl: null,
-      },
+        imageUrl: imageUri, // captured label photo (local file)
+      };
+
+      saveScanToHistory(product).catch(() => {});
+      navigation.navigate('Result', {product});
+
+      // Back on this tab (after Result) the live camera is ready again
+      setScreenState('camera');
+    } catch (err) {
+      console.error('[IngredientOcrScreen] Capture/OCR error:', err);
+      setCapturing(false);
+      setScreenState('error');
+    }
+  }, [capturing, flash, navigation, fallbackBarcode]);
+
+  // Clear the fallback params when leaving, so a later visit starts clean
+  useFocusEffect(
+    useCallback(
+      () => () => navigation.setParams({barcode: undefined, notice: undefined}),
+      [navigation],
+    ),
+  );
+
+  const resetToCamera = useCallback(() => {
+    setScreenState('camera');
+  }, []);
+
+  // ── Permission flow ────────────────────────────────────────────────────────
+  const [cameraGranted, setCameraGranted] = useState(
+    () => Camera.getCameraPermissionStatus() === 'granted',
+  );
+  const [permDenied, setPermDenied] = useState(false);
+
+  // CTA: 'granted' opens the live camera immediately; 'denied' (including
+  // Android suppressing the system dialog) shows a note and sends the user to
+  // Settings. Once denied, the same CTA becomes "Open Settings".
+  const handleScanPress = useCallback(async () => {
+    if (permDenied) {
+      Linking.openSettings();
+      return;
+    }
+    const status = await Camera.requestCameraPermission();
+    if (status === 'granted') {
+      setPermDenied(false);
+      setCameraGranted(true);
+    } else {
+      setPermDenied(true);
+      Linking.openSettings();
+    }
+  }, [permDenied]);
+
+  // Re-check when returning from Settings so the camera opens if enabled
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', st => {
+      if (st === 'active' && Camera.getCameraPermissionStatus() === 'granted') {
+        setPermDenied(false);
+        setCameraGranted(true);
+      }
     });
-  }, [editedText, parsedIngredients, navigation]);
+    return () => sub.remove();
+  }, []);
 
-  // ── Permission: loading ────────────────────────────────────────────────────
-  if (hasPermission === null) {
+  // ── Pre-camera card: friendly text + single CTA ────────────────────────────
+  if (!cameraGranted) {
     return (
       <View style={styles.centered}>
-        <ActivityIndicator size="large" color={colors.primary} />
-      </View>
-    );
-  }
+        <View style={styles.permCard}>
+          <NoticeBanner text={notice} barcode={fallbackBarcode} style={styles.noticeInCard} />
+          <View style={styles.permIconCircle}>
+            <Ionicons name="document-text-outline" size={42} color={colors.primary} />
+          </View>
+          <Text style={styles.permTitle}>Scan an ingredients label</Text>
+          <Text style={styles.permBody}>
+            Take a photo of the ingredients list and we'll read it for you,
+            then break it down into a clean, easy-to-scan list you can review
+            and edit.
+          </Text>
 
-  // ── Permission: denied ────────────────────────────────────────────────────
-  if (!hasPermission) {
-    return (
-      <View style={styles.centered}>
-        <Ionicons name="camera-off-outline" size={56} color={colors.textSecondary} />
-        <Text style={styles.permTitle}>Camera access needed</Text>
-        <Text style={styles.permBody}>
-          Allow camera access to photograph ingredient labels.
-        </Text>
-        <TouchableOpacity style={styles.btn} activeOpacity={0.8} onPress={requestPermission}>
-          <Text style={styles.btnText}>Grant Permission</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={[styles.btn, styles.btnOutline]}
-          activeOpacity={0.8}
-          onPress={() => Linking.openSettings()}>
-          <Text style={[styles.btnText, styles.btnOutlineText]}>Open Settings</Text>
-        </TouchableOpacity>
+          <View style={styles.permPoints}>
+            <PermPoint icon="camera-outline" text="Frame the label and tap capture" />
+            <PermPoint icon="list-outline" text="Ingredients split into a clear list" />
+            <PermPoint icon="create-outline" text="Fix any misread text before continuing" />
+            <PermPoint icon="lock-closed-outline" text="Text is read on your device — nothing is uploaded" />
+          </View>
+
+          {permDenied && (
+            <Text style={styles.permBlockedNote}>
+              Camera access is off. Enable it in Settings to scan labels.
+            </Text>
+          )}
+
+          <TouchableOpacity
+            style={styles.btn}
+            activeOpacity={0.8}
+            onPress={handleScanPress}>
+            <Ionicons
+              name={permDenied ? 'settings-outline' : 'scan-outline'}
+              size={18}
+              color="#FFF"
+              style={styles.btnIcon}
+            />
+            <Text style={styles.btnText}>
+              {permDenied ? 'Open Settings' : 'Scan Label'}
+            </Text>
+          </TouchableOpacity>
+
+          <Text style={styles.permDisclaimer}>
+            Informational only — not medical advice. Consult a healthcare
+            professional for dietary decisions.
+          </Text>
+        </View>
       </View>
     );
   }
@@ -183,100 +277,29 @@ export default function IngredientOcrScreen({navigation}) {
     );
   }
 
-  // ── Review & edit ──────────────────────────────────────────────────────────
-  if (screenState === 'review') {
-    return (
-      <KeyboardAvoidingView
-        style={styles.root}
-        behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-        <ScrollView
-          contentContainerStyle={[styles.reviewScroll, {paddingBottom: insets.bottom + 16}]}
-          keyboardShouldPersistTaps="handled">
-
-          {/* ── Header ──────────────────────────────────────────────── */}
-          <View style={styles.reviewHeader}>
-            <Ionicons name="checkmark-circle" size={26} color={colors.primary} />
-            <Text style={styles.reviewTitle}>Ingredients Found</Text>
-          </View>
-
-          {/* ── Ingredient count badge ───────────────────────────────── */}
-          <View style={styles.countRow}>
-            <View style={styles.countBadge}>
-              <Text style={styles.countText}>
-                {parsedIngredients.length} ingredient{parsedIngredients.length !== 1 ? 's' : ''} detected
-              </Text>
-            </View>
-          </View>
-
-          {/* ── Parsed ingredient chips ──────────────────────────────── */}
-          {parsedIngredients.length > 0 && (
-            <View style={styles.chipsCard}>
-              {parsedIngredients.map((item, idx) => (
-                <View key={idx} style={styles.chip}>
-                  <Text style={styles.chipName} numberOfLines={2}>{item.name}</Text>
-                  {item.quantity ? (
-                    <View style={styles.chipQtyBadge}>
-                      <Text style={styles.chipQtyText}>{item.quantity}</Text>
-                    </View>
-                  ) : null}
-                </View>
-              ))}
-            </View>
-          )}
-
-          {/* ── Divider ─────────────────────────────────────────────── */}
-          <View style={styles.dividerRow}>
-            <View style={styles.dividerLine} />
-            <Text style={styles.dividerLabel}>Edit raw text if needed</Text>
-            <View style={styles.dividerLine} />
-          </View>
-
-          {/* ── Editable raw text ────────────────────────────────────── */}
-          <View style={styles.textInputCard}>
-            <TextInput
-              style={styles.textInput}
-              value={editedText}
-              onChangeText={setEditedText}
-              multiline
-              textAlignVertical="top"
-              placeholder="Extracted ingredients will appear here…"
-              placeholderTextColor={colors.textSecondary}
-            />
-          </View>
-
-          {/* ── Actions ─────────────────────────────────────────────── */}
-          <TouchableOpacity
-            style={[styles.btn, !editedText.trim() && styles.btnDisabled]}
-            activeOpacity={0.8}
-            disabled={!editedText.trim()}
-            onPress={handleContinue}>
-            <Ionicons name="arrow-forward-circle-outline" size={18} color="#FFF" style={styles.btnIcon} />
-            <Text style={styles.btnText}>Continue to Result</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={[styles.btn, styles.btnOutline, {marginTop: 10}]}
-            activeOpacity={0.8}
-            onPress={resetToCamera}>
-            <Ionicons name="camera-outline" size={16} color={colors.primary} style={styles.btnIcon} />
-            <Text style={[styles.btnText, styles.btnOutlineText]}>Retake Photo</Text>
-          </TouchableOpacity>
-
-        </ScrollView>
-      </KeyboardAvoidingView>
-    );
-  }
-
   // ── Camera preview ─────────────────────────────────────────────────────────
   return (
     <View style={styles.root}>
-      <Camera
-        ref={cameraRef}
-        style={StyleSheet.absoluteFill}
-        device={device}
-        isActive={isFocused && screenState === 'camera'}
-        photo={true}
-      />
+      {/* Camera only exists while this tab is focused; active only when
+          focused + permitted + in capture mode */}
+      {cameraFailed ? (
+        <View style={StyleSheet.absoluteFill}>
+          <CameraFailedView onRetry={retryCamera} />
+        </View>
+      ) : (
+        isFocused && (
+          <Camera
+            key={cameraKey}
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            device={device}
+            isActive={isFocused && cameraGranted && screenState === 'camera'}
+            photo={true}
+            androidPreviewViewType="texture-view"
+            onError={onCameraError}
+          />
+        )
+      )}
 
       {/* Top controls */}
       <View style={[styles.topBar, {paddingTop: insets.top + 8}]}>
@@ -291,6 +314,12 @@ export default function IngredientOcrScreen({navigation}) {
           />
         </TouchableOpacity>
       </View>
+
+      <NoticeBanner
+        text={notice}
+        barcode={fallbackBarcode}
+        style={[styles.noticeOverlay, {top: insets.top + 64}]}
+      />
 
       {/* Aim guide */}
       <View style={styles.aimGuide}>
@@ -336,6 +365,21 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 32,
   },
+  notice: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#CCFBF1',
+    borderWidth: 1,
+    borderColor: '#99F6E4',
+    borderRadius: radius.button,
+    padding: 12,
+  },
+  noticeInCard: {alignSelf: 'stretch', marginBottom: 16},
+  noticeOverlay: {position: 'absolute', left: 16, right: 16, zIndex: 10},
+  noticeTextWrap: {flex: 1},
+  noticeText: {fontSize: 13, fontWeight: '600', color: colors.textPrimary, lineHeight: 18},
+  noticeSub: {marginTop: 2, fontSize: 11, color: colors.textSecondary},
   permTitle: {
     fontSize: 18,
     fontWeight: '700',
@@ -350,6 +394,39 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 21,
     marginBottom: 24,
+  },
+  permCard: {
+    width: '100%',
+    backgroundColor: colors.surface,
+    borderRadius: radius.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 24,
+    alignItems: 'center',
+  },
+  permIconCircle: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#CCFBF1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  permPoints: {alignSelf: 'stretch', gap: 10, marginBottom: 20},
+  permPointRow: {flexDirection: 'row', alignItems: 'center', gap: 10},
+  permPointText: {fontSize: 13, color: colors.textPrimary, flexShrink: 1},
+  permBlockedNote: {
+    fontSize: 13,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    marginBottom: 12,
+  },
+  permDisclaimer: {
+    fontSize: 11,
+    color: colors.textSecondary,
+    textAlign: 'center',
+    lineHeight: 16,
+    marginTop: 12,
   },
   loadingText: {marginTop: 12, fontSize: 14, color: colors.textSecondary},
   ocrTitle: {
@@ -373,14 +450,7 @@ const styles = StyleSheet.create({
     width: '100%',
     marginBottom: 0,
   },
-  btnDisabled: {opacity: 0.45},
-  btnOutline: {
-    backgroundColor: 'transparent',
-    borderWidth: 1.5,
-    borderColor: colors.primary,
-  },
   btnText: {color: '#FFF', fontWeight: '600', fontSize: 15},
-  btnOutlineText: {color: colors.primary},
   btnIcon: {marginRight: 8},
 
   // ── Camera top bar
@@ -447,123 +517,5 @@ const styles = StyleSheet.create({
     height: 52,
     borderRadius: 26,
     backgroundColor: colors.primary,
-  },
-
-  // ── Review screen
-  reviewScroll: {
-    backgroundColor: colors.background,
-    padding: 20,
-    flexGrow: 1,
-  },
-  reviewHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    marginBottom: 10,
-  },
-  reviewTitle: {
-    fontSize: 20,
-    fontWeight: '700',
-    color: colors.textPrimary,
-  },
-
-  // ── Count badge
-  countRow: {
-    marginBottom: 14,
-  },
-  countBadge: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#CCFBF1',
-    borderRadius: 20,
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderWidth: 1,
-    borderColor: '#99F6E4',
-  },
-  countText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#0F766E',
-  },
-
-  // ── Ingredient chips
-  chipsCard: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.card,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 12,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 8,
-    marginBottom: 18,
-    elevation: 1,
-  },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.background,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 5,
-    paddingLeft: 12,
-    paddingRight: 6,
-    gap: 6,
-    maxWidth: '100%',
-  },
-  chipName: {
-    fontSize: 13,
-    color: colors.textPrimary,
-    fontWeight: '500',
-    flexShrink: 1,
-  },
-  chipQtyBadge: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-  },
-  chipQtyText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#FFF',
-  },
-
-  // ── Divider between chips and raw editor
-  dividerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 14,
-  },
-  dividerLine: {
-    flex: 1,
-    height: 1,
-    backgroundColor: colors.border,
-  },
-  dividerLabel: {
-    fontSize: 11,
-    color: colors.textSecondary,
-    fontWeight: '600',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-  },
-
-  // ── Raw text editor
-  textInputCard: {
-    backgroundColor: colors.surface,
-    borderRadius: radius.card,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: 14,
-    marginBottom: 20,
-    minHeight: 140,
-  },
-  textInput: {
-    fontSize: 13,
-    color: colors.textPrimary,
-    lineHeight: 21,
-    minHeight: 120,
   },
 });

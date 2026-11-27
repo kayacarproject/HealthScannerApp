@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useCallback} from 'react';
+import React, {useState, useCallback, useRef, useEffect} from 'react';
 import {
   View,
   Text,
@@ -8,59 +8,141 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
+import {useFocusEffect} from '@react-navigation/native';
 import Ionicons from '@react-native-vector-icons/ionicons';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {colors, radius} from '../theme';
-import {saveHealthProfile, loadHealthProfile} from '../storage/localStorage';
+import {
+  saveHealthProfile,
+  loadHealthProfile,
+  getMissingProfileFields,
+  DEFAULT_PROFILE,
+} from '../storage/localStorage';
 
-const FOCUS_TAGS = [
-  {key: 'Sugar',   icon: 'water-outline'},
-  {key: 'BP',      icon: 'pulse-outline'},
-  {key: 'Heart',   icon: 'heart-outline'},
-  {key: 'Weight',  icon: 'barbell-outline'},
-  {key: 'General', icon: 'shield-checkmark-outline'},
+// Keys are stored in AsyncStorage — keep them stable (older saves use the first five)
+const FOCUS_OPTIONS = [
+  {key: 'Sugar',     icon: 'water-outline',            title: 'Sugar / Diabetes',          desc: 'Flag added sugar and high-sugar products'},
+  {key: 'BP',        icon: 'pulse-outline',            title: 'BP / Low Sodium',           desc: 'Watch salt and sodium-heavy ingredients'},
+  {key: 'Heart',     icon: 'heart-outline',            title: 'Heart / Low Saturated Fat', desc: 'Spot saturated fat, palm oil and trans fats'},
+  {key: 'Weight',    icon: 'barbell-outline',          title: 'Weight / Calorie Control',  desc: 'Keep an eye on energy and fat per serving'},
+  {key: 'Digestion', icon: 'leaf-outline',             title: 'Digestion / Gut Friendly',  desc: 'Notice additives and artificial sweeteners'},
+  {key: 'General',   icon: 'shield-checkmark-outline', title: 'General Wellness',          desc: 'A balanced, all-round ingredient check'},
 ];
+
+const DIET_OPTIONS = [
+  {key: 'Vegetarian', icon: 'leaf-outline'},
+  {key: 'Vegan',      icon: 'flower-outline'},
+  {key: 'Eggetarian', icon: 'egg-outline'},
+  {key: 'Jain',       icon: 'sunny-outline'},
+  {key: 'Any',        icon: 'restaurant-outline', label: 'Balanced / Any'},
+];
+
+const ALLERGEN_OPTIONS = [
+  {key: 'Nuts',   icon: 'nutrition-outline'},
+  {key: 'Dairy',  icon: 'water-outline'},
+  {key: 'Gluten', icon: 'pizza-outline'},
+  {key: 'Soy',    icon: 'ellipse-outline'},
+  {key: 'Egg',    icon: 'egg-outline'},
+];
+
+// ── Small building blocks ─────────────────────────────────────────────────────
+
+function SectionCard({icon, title, subtitle, children}) {
+  return (
+    <View style={styles.card}>
+      <View style={styles.cardHead}>
+        <View style={styles.cardIcon}>
+          <Ionicons name={icon} size={20} color={colors.primary} />
+        </View>
+        <View style={styles.cardHeadText}>
+          <Text style={styles.cardTitle}>{title}</Text>
+          <Text style={styles.cardSubtitle}>{subtitle}</Text>
+        </View>
+      </View>
+      {children}
+    </View>
+  );
+}
+
+function Chip({label, icon, active, onPress}) {
+  return (
+    <TouchableOpacity
+      style={[styles.chip, active && styles.chipActive]}
+      onPress={onPress}
+      activeOpacity={0.75}>
+      <Ionicons name={icon} size={15} color={active ? '#FFFFFF' : colors.primary} />
+      <Text style={[styles.chipText, active && styles.chipTextActive]}>{label}</Text>
+    </TouchableOpacity>
+  );
+}
+
+function FieldLabel({children}) {
+  return <Text style={styles.fieldLabel}>{children}</Text>;
+}
+
+const toggle = (list, key) =>
+  list.includes(key) ? list.filter(k => k !== key) : [...list, key];
+
+// ── Screen ────────────────────────────────────────────────────────────────────
 
 export default function HealthProfileScreen() {
   const insets = useSafeAreaInsets();
 
-  const [name,      setName]      = useState('');
-  const [focusTags, setFocusTags] = useState([]);
-  const [allergies, setAllergies] = useState('');
-  const [notes,     setNotes]     = useState('');
+  const [form, setForm] = useState(DEFAULT_PROFILE);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [ageError, setAgeError] = useState(false);
 
-  const [loading,  setLoading]  = useState(true);
-  const [saving,   setSaving]   = useState(false);
-  const [saved,    setSaved]    = useState(false);
+  const dirty = useRef(false);        // unsaved edits — don't overwrite on refocus
+  const toastTimer = useRef(null);
 
-  // ── Load saved profile on mount ───────────────────────────────────────────
-  useEffect(() => {
-    loadHealthProfile().then(profile => {
-      if (profile) {
-        setName(profile.name      ?? '');
-        setFocusTags(profile.focusTags ?? []);
-        setAllergies(profile.allergies ?? '');
-        setNotes(profile.notes    ?? '');
-      }
-      setLoading(false);
-    });
-  }, []);
-
-  // ── Toggle a focus tag ────────────────────────────────────────────────────
-  const toggleTag = useCallback(key => {
-    setFocusTags(prev =>
-      prev.includes(key) ? prev.filter(t => t !== key) : [...prev, key],
-    );
+  const update = useCallback(patch => {
+    dirty.current = true;
     setSaved(false);
+    setForm(prev => ({...prev, ...patch}));
   }, []);
 
-  // ── Save ──────────────────────────────────────────────────────────────────
+  // Reload whenever the screen gains focus (unless the user has unsaved edits)
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      if (!dirty.current) {
+        loadHealthProfile().then(profile => {
+          if (!active) return;
+          if (profile) setForm(profile);
+          setLoading(false);
+        });
+      } else {
+        setLoading(false);
+      }
+      return () => {
+        active = false;
+      };
+    }, []),
+  );
+
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
   const handleSave = useCallback(async () => {
+    const ageNum = form.age ? parseInt(form.age, 10) : null;
+    if (ageNum !== null && (ageNum < 1 || ageNum > 120)) {
+      setAgeError(true);
+      return;
+    }
+    setAgeError(false);
     setSaving(true);
-    await saveHealthProfile({name: name.trim(), focusTags, allergies: allergies.trim(), notes: notes.trim()});
-    setSaving(false);
-    setSaved(true);
-  }, [name, focusTags, allergies, notes]);
+    try {
+      const clean = await saveHealthProfile(form);
+      setForm(clean);
+      dirty.current = false;
+      setSaved(true);
+      clearTimeout(toastTimer.current);
+      toastTimer.current = setTimeout(() => setSaved(false), 3000);
+    } finally {
+      setSaving(false);
+    }
+  }, [form]);
 
   if (loading) {
     return (
@@ -70,87 +152,176 @@ export default function HealthProfileScreen() {
     );
   }
 
+  // Completion banner: name, diet, focus, allergy info
+  const missing = getMissingProfileFields(form);
+  const doneCount = 4 - missing.length - (form.dietType ? 0 : 1);
+  const pct = Math.round((Math.max(0, doneCount) / 4) * 100);
+  const firstName = form.name.trim().split(' ')[0];
+
   return (
     <ScrollView
       style={styles.scroll}
       contentContainerStyle={[styles.content, {paddingBottom: insets.bottom + 32}]}
       keyboardShouldPersistTaps="handled">
 
-      {/* Header */}
-      <View style={styles.header}>
-        <Ionicons name="person-circle-outline" size={44} color={colors.primary} />
-        <Text style={styles.heading}>Health Profile</Text>
-        <Text style={styles.subheading}>Personalise your scan experience</Text>
+      {/* Header banner */}
+      <View style={styles.banner}>
+        <View style={styles.bannerIcon}>
+          <Ionicons name="person" size={26} color={colors.primary} />
+        </View>
+        <View style={styles.bannerText}>
+          <Text style={styles.bannerTitle}>
+            {firstName ? `${firstName}'s Health Profile` : 'Your Health Profile'}
+          </Text>
+          <Text style={styles.bannerSub}>
+            Personalise how products are checked for you
+          </Text>
+          <View style={styles.progressTrack}>
+            <View style={[styles.progressFill, {width: `${pct}%`}]} />
+          </View>
+          <Text style={styles.progressLabel}>{pct}% complete</Text>
+        </View>
       </View>
 
-      {/* Name */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Your name</Text>
+      {/* 1 · Basic profile */}
+      <SectionCard
+        icon="person-circle-outline"
+        title="Basic Profile"
+        subtitle="Tell us a little about you">
+        <FieldLabel>Name</FieldLabel>
         <TextInput
           style={styles.input}
           placeholder="e.g. Alex"
           placeholderTextColor={colors.textSecondary}
-          value={name}
-          onChangeText={v => { setName(v); setSaved(false); }}
+          value={form.name}
+          onChangeText={v => update({name: v})}
           returnKeyType="done"
         />
-      </View>
 
-      {/* Health focus tags */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Health focus</Text>
-        <Text style={styles.hint}>Select all that apply</Text>
-        <View style={styles.tagRow}>
-          {FOCUS_TAGS.map(({key, icon}) => {
-            const active = focusTags.includes(key);
-            return (
-              <TouchableOpacity
-                key={key}
-                style={[styles.tag, active && styles.tagActive]}
-                onPress={() => toggleTag(key)}
-                activeOpacity={0.75}>
-                <Ionicons
-                  name={icon}
-                  size={16}
-                  color={active ? '#FFFFFF' : colors.primary}
-                  style={styles.tagIcon}
-                />
-                <Text style={[styles.tagText, active && styles.tagTextActive]}>
-                  {key}
-                </Text>
-              </TouchableOpacity>
-            );
-          })}
+        <FieldLabel>Age (optional)</FieldLabel>
+        <TextInput
+          style={[styles.input, styles.inputShort, ageError && styles.inputError]}
+          placeholder="e.g. 35"
+          placeholderTextColor={colors.textSecondary}
+          value={form.age}
+          onChangeText={v => {
+            setAgeError(false);
+            update({age: v.replace(/\D/g, '').slice(0, 3)});
+          }}
+          keyboardType="number-pad"
+          maxLength={3}
+        />
+        {ageError && <Text style={styles.errorText}>Enter an age between 1 and 120.</Text>}
+
+        <FieldLabel>Diet type (optional)</FieldLabel>
+        <View style={styles.chipRow}>
+          {DIET_OPTIONS.map(d => (
+            <Chip
+              key={d.key}
+              label={d.label || d.key}
+              icon={d.icon}
+              active={form.dietType === d.key}
+              onPress={() => update({dietType: form.dietType === d.key ? '' : d.key})}
+            />
+          ))}
         </View>
-      </View>
+      </SectionCard>
 
-      {/* Allergies */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Allergies / intolerances</Text>
+      {/* 2 · Health & nutrition focus */}
+      <SectionCard
+        icon="heart-circle-outline"
+        title="Health & Nutrition Focus"
+        subtitle="Pick everything that matters to you">
+        {FOCUS_OPTIONS.map(o => {
+          const active = form.focusTags.includes(o.key);
+          return (
+            <TouchableOpacity
+              key={o.key}
+              style={[styles.option, active && styles.optionActive]}
+              onPress={() => update({focusTags: toggle(form.focusTags, o.key)})}
+              activeOpacity={0.75}>
+              <View style={[styles.optionIcon, active && styles.optionIconActive]}>
+                <Ionicons name={o.icon} size={20} color={active ? '#FFFFFF' : colors.primary} />
+              </View>
+              <View style={styles.optionText}>
+                <Text style={styles.optionTitle}>{o.title}</Text>
+                <Text style={styles.optionDesc}>{o.desc}</Text>
+              </View>
+              <Ionicons
+                name={active ? 'checkmark-circle' : 'ellipse-outline'}
+                size={22}
+                color={active ? colors.primary : colors.border}
+              />
+            </TouchableOpacity>
+          );
+        })}
+      </SectionCard>
+
+      {/* 3 · Allergies & avoid list */}
+      <SectionCard
+        icon="alert-circle-outline"
+        title="Allergies & Avoid List"
+        subtitle="Ingredients you need to steer clear of">
+        <FieldLabel>Common allergens</FieldLabel>
+        <View style={styles.chipRow}>
+          {ALLERGEN_OPTIONS.map(a => (
+            <Chip
+              key={a.key}
+              label={a.key}
+              icon={a.icon}
+              active={form.allergenTags.includes(a.key)}
+              onPress={() =>
+                update({
+                  allergenTags: toggle(form.allergenTags, a.key),
+                  noAllergies: false,
+                })
+              }
+            />
+          ))}
+          <Chip
+            label="None known"
+            icon="checkmark-done-outline"
+            active={form.noAllergies}
+            onPress={() =>
+              update(
+                form.noAllergies
+                  ? {noAllergies: false}
+                  : {noAllergies: true, allergenTags: [], allergies: ''},
+              )
+            }
+          />
+        </View>
+
+        <FieldLabel>Other allergies / ingredients to avoid</FieldLabel>
         <TextInput
           style={styles.input}
-          placeholder="e.g. peanuts, gluten, lactose"
+          placeholder="e.g. peanuts, palm oil, MSG"
           placeholderTextColor={colors.textSecondary}
-          value={allergies}
-          onChangeText={v => { setAllergies(v); setSaved(false); }}
+          value={form.allergies}
+          onChangeText={v => update({allergies: v, noAllergies: false})}
           returnKeyType="done"
         />
-      </View>
 
-      {/* Notes */}
-      <View style={styles.card}>
-        <Text style={styles.label}>Additional notes</Text>
+        <FieldLabel>Personal notes</FieldLabel>
         <TextInput
           style={[styles.input, styles.inputMulti]}
           placeholder="Any other dietary preferences or conditions…"
           placeholderTextColor={colors.textSecondary}
-          value={notes}
-          onChangeText={v => { setNotes(v); setSaved(false); }}
+          value={form.notes}
+          onChangeText={v => update({notes: v})}
           multiline
           numberOfLines={3}
           textAlignVertical="top"
         />
-      </View>
+      </SectionCard>
+
+      {/* Save confirmation */}
+      {saved && (
+        <View style={styles.toast}>
+          <Ionicons name="checkmark-circle" size={20} color={colors.primary} />
+          <Text style={styles.toastText}>Profile saved on this device</Text>
+        </View>
+      )}
 
       {/* Save button */}
       <TouchableOpacity
@@ -166,7 +337,6 @@ export default function HealthProfileScreen() {
               name={saved ? 'checkmark-circle' : 'save-outline'}
               size={20}
               color="#FFFFFF"
-              style={styles.saveBtnIcon}
             />
             <Text style={styles.saveBtnText}>{saved ? 'Saved!' : 'Save Profile'}</Text>
           </>
@@ -174,10 +344,13 @@ export default function HealthProfileScreen() {
       </TouchableOpacity>
 
       {/* Disclaimer */}
-      <Text style={styles.disclaimer}>
-        ℹ️ This information is stored only on your device and is used solely to
-        personalise ingredient highlights. It is not medical advice.
-      </Text>
+      <View style={styles.disclaimerRow}>
+        <Ionicons name="information-circle-outline" size={16} color={colors.textSecondary} />
+        <Text style={styles.disclaimer}>
+          This information is stored only on your device and is used solely to
+          personalise ingredient highlights. It is not medical advice.
+        </Text>
+      </View>
     </ScrollView>
   );
 }
@@ -185,25 +358,75 @@ export default function HealthProfileScreen() {
 // ── Styles ────────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   scroll: {flex: 1, backgroundColor: colors.background},
-  content: {padding: 20, gap: 14},
+  content: {padding: 20, gap: 16},
+  centered: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.background,
+  },
 
-  centered: {flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.background},
+  // Banner
+  banner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: radius.card,
+    padding: 18,
+    gap: 14,
+  },
+  bannerIcon: {
+    width: 52,
+    height: 52,
+    borderRadius: 26,
+    backgroundColor: '#CCFBF1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  bannerText: {flex: 1},
+  bannerTitle: {fontSize: 18, fontWeight: '700', color: '#FFFFFF'},
+  bannerSub: {marginTop: 2, fontSize: 12, color: 'rgba(255,255,255,0.85)'},
+  progressTrack: {
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: 'rgba(255,255,255,0.25)',
+    marginTop: 10,
+    overflow: 'hidden',
+  },
+  progressFill: {height: '100%', borderRadius: 3, backgroundColor: '#FFFFFF'},
+  progressLabel: {marginTop: 4, fontSize: 11, fontWeight: '600', color: 'rgba(255,255,255,0.9)'},
 
-  header: {alignItems: 'center', paddingVertical: 8, gap: 4},
-  heading: {fontSize: 22, fontWeight: '700', color: colors.textPrimary},
-  subheading: {fontSize: 13, color: colors.textSecondary},
-
+  // Cards
   card: {
     backgroundColor: colors.surface,
     borderRadius: radius.card,
     borderWidth: 1,
     borderColor: colors.border,
     padding: 18,
-    gap: 8,
+    gap: 10,
+    elevation: 1,
   },
-  label: {fontSize: 13, fontWeight: '700', color: colors.textPrimary, textTransform: 'uppercase', letterSpacing: 0.5},
-  hint:  {fontSize: 12, color: colors.textSecondary, marginTop: -4},
+  cardHead: {flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 4},
+  cardIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: '#CCFBF1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cardHeadText: {flex: 1},
+  cardTitle: {fontSize: 16, fontWeight: '700', color: colors.textPrimary},
+  cardSubtitle: {marginTop: 1, fontSize: 12, color: colors.textSecondary},
 
+  fieldLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.textSecondary,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginTop: 4,
+  },
   input: {
     borderWidth: 1,
     borderColor: colors.border,
@@ -214,26 +437,65 @@ const styles = StyleSheet.create({
     color: colors.textPrimary,
     backgroundColor: colors.background,
   },
-  inputMulti: {height: 80, paddingTop: 10},
+  inputShort: {width: 110},
+  inputMulti: {height: 84, paddingTop: 10},
+  inputError: {borderColor: '#DC2626'},
+  errorText: {fontSize: 12, color: '#DC2626', marginTop: -4},
 
-  // Tags
-  tagRow: {flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 4},
-  tag: {
+  // Chips
+  chipRow: {flexDirection: 'row', flexWrap: 'wrap', gap: 8},
+  chip: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: 6,
     borderWidth: 1.5,
     borderColor: colors.primary,
     borderRadius: 20,
-    paddingVertical: 6,
+    paddingVertical: 7,
     paddingHorizontal: 12,
-    gap: 4,
   },
-  tagActive: {backgroundColor: colors.primary, borderColor: colors.primary},
-  tagIcon: {},
-  tagText: {fontSize: 13, fontWeight: '600', color: colors.primary},
-  tagTextActive: {color: '#FFFFFF'},
+  chipActive: {backgroundColor: colors.primary},
+  chipText: {fontSize: 13, fontWeight: '600', color: colors.primary},
+  chipTextActive: {color: '#FFFFFF'},
+
+  // Focus options
+  option: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.button,
+    padding: 12,
+    backgroundColor: colors.background,
+  },
+  optionActive: {borderColor: colors.primary, backgroundColor: '#F0FDFA'},
+  optionIcon: {
+    width: 38,
+    height: 38,
+    borderRadius: 10,
+    backgroundColor: '#CCFBF1',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  optionIconActive: {backgroundColor: colors.primary},
+  optionText: {flex: 1},
+  optionTitle: {fontSize: 14, fontWeight: '700', color: colors.textPrimary},
+  optionDesc: {marginTop: 2, fontSize: 12, lineHeight: 17, color: colors.textSecondary},
 
   // Save
+  toast: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#CCFBF1',
+    borderWidth: 1,
+    borderColor: '#99F6E4',
+    borderRadius: radius.button,
+    paddingVertical: 10,
+  },
+  toastText: {fontSize: 14, fontWeight: '600', color: colors.primary},
   saveBtn: {
     backgroundColor: colors.primary,
     borderRadius: radius.button,
@@ -242,17 +504,10 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     gap: 8,
-    marginTop: 4,
   },
   saveBtnDisabled: {opacity: 0.6},
-  saveBtnIcon: {},
   saveBtnText: {color: '#FFFFFF', fontSize: 16, fontWeight: '700'},
 
-  disclaimer: {
-    fontSize: 12,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    lineHeight: 18,
-    paddingHorizontal: 8,
-  },
+  disclaimerRow: {flexDirection: 'row', gap: 6, paddingHorizontal: 4},
+  disclaimer: {flex: 1, fontSize: 12, color: colors.textSecondary, lineHeight: 18},
 });
